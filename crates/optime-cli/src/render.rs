@@ -17,38 +17,37 @@ const FADE_SECONDS: f64 = 8.0;
 const FADE_FRAMES: usize = (SAMPLE_RATE as f64 * FADE_SECONDS) as usize;
 const MAX_SONG_RENDER_SECONDS: f64 = 600.0;
 
-/// Returns the duration up to the first sequence loop marker, or None when
-/// the sequence ends naturally before looping. This is a lightweight
-/// sequence-only preflight; it does not render audio.
-fn first_loop_seconds(data: &dyn optime_core::SoundData, id: u32) -> Option<f64> {
+/// Sequence preflight: determine whether a song ends naturally or loops.
+#[derive(Clone, Copy, Debug)]
+enum SequencePlan {
+    OneShot { seconds: f64 },
+    Looping { loop_seconds: f64 },
+}
+
+fn sequence_plan(data: &dyn optime_core::SoundData, id: u32) -> Option<SequencePlan> {
     let mut player = data.make_player(id)?;
     let tick_rate = player.tick_rate();
-    if !tick_rate.is_finite() || tick_rate <= 0.0 {
-        return None;
-    }
-
+    if !tick_rate.is_finite() || tick_rate <= 0.0 { return None; }
     let config = PerDeviceSettings::neutral();
     let mut feedback = TickFeedback::default();
     let mut events = Vec::new();
     let max_ticks = (tick_rate * MAX_SONG_RENDER_SECONDS) as u64;
-
     for ticks in 1..=max_ticks {
         events.clear();
         player.tick(&mut feedback, &config, &mut events);
         for event in &events {
             match event {
-                SynthEvent::Looped => return Some(ticks as f64 / tick_rate),
-                SynthEvent::Ended => return None,
+                SynthEvent::Looped => return Some(SequencePlan::Looping { loop_seconds: ticks as f64 / tick_rate }),
+                SynthEvent::Ended => return Some(SequencePlan::OneShot { seconds: ticks as f64 / tick_rate }),
                 _ => {}
             }
         }
     }
-
     None
 }
 
 #[derive(Parser)]
-#[command(about = "Render every playable song to 48 kHz stereo PCM WAV: two complete passes, then an 8-second fade on the third.")]
+#[command(about = "Render every playable song to 48 kHz stereo PCM WAV: one pass for one-shots, two passes for looped songs, no fade.")]
 pub struct Args {
     archive: PathBuf,
     out_dir: PathBuf,
@@ -76,7 +75,7 @@ pub fn run(args: Args) -> ExitCode {
 
     let song_ids = data.song_ids();
     println!(
-        "Loaded {} songs; one-shot tracks play once, looping tracks play twice, with an 8s ending fade (48 kHz stereo).",
+        "Loaded {} songs; one-shot tracks play once, looping tracks play twice, without fades (48 kHz stereo).",
         song_ids.len()
     );
 
@@ -91,117 +90,41 @@ pub fn run(args: Args) -> ExitCode {
             continue;
         };
 
-        // Preflight the sequence to distinguish a one-shot song from a
-        // looped song. One-shots are allowed to reach their natural Ended
-        // event. Looped songs get exactly one repeat, then fade during the
-        // second pass so they finish without a hard cut.
-        let loop_seconds = first_loop_seconds(&*data, id);
-        controller.set_loop_and_transition(LoopAndTransitionOptions {
-            loops_before_fade: None,
-            too_long_after_loop_threshold_seconds: None,
-            fade_on_end: true,
-            grace_seconds: 0.0,
-            fade_seconds: FADE_SECONDS,
-        });
+        // One-shot sequences render once; looped sequences render two passes.
+        // No transition or fade is applied.
+        controller.set_loop_and_transition(LoopAndTransitionOptions::none());
 
-        let estimated_seconds = data
-            .song_length_seconds(id)
-            .unwrap_or(180.0)
-            .clamp(1.0, MAX_SONG_RENDER_SECONDS);
-        let loop_frames = loop_seconds
-            .map(|seconds| (seconds * f64::from(SAMPLE_RATE)) as usize);
-        let max_frames = match loop_frames {
-            Some(period) => period
-                .saturating_mul(2)
-                .saturating_add(BLOCK_FRAMES * 4)
-                .min((MAX_SONG_RENDER_SECONDS * f64::from(SAMPLE_RATE)) as usize),
-            None => ((estimated_seconds + FADE_SECONDS + 10.0)
-                .min(MAX_SONG_RENDER_SECONDS)
-                * f64::from(SAMPLE_RATE)) as usize,
+        let plan = sequence_plan(&*data, id);
+        let (passes_label, target_frames) = match plan {
+            Some(SequencePlan::OneShot { seconds }) => (
+                "one-shot",
+                (seconds * f64::from(SAMPLE_RATE)) as usize,
+            ),
+            Some(SequencePlan::Looping { loop_seconds }) => (
+                "two passes",
+                (loop_seconds * 2.0 * f64::from(SAMPLE_RATE)) as usize,
+            ),
+            None => {
+                eprintln!("song {id}: could not determine sequence end/loop; skipping safely");
+                continue;
+            }
         };
 
-        let mut stereo = Vec::<f32>::new();
+        if target_frames == 0 || target_frames > (MAX_SONG_RENDER_SECONDS * f64::from(SAMPLE_RATE)) as usize {
+            eprintln!("song {id}: invalid or excessive estimated duration; skipping");
+            continue;
+        }
+
+        let mut stereo = Vec::<f32>::with_capacity(target_frames.saturating_mul(2));
         let mut buf = vec![0.0f32; 2 * BLOCK_FRAMES];
         let mut rendered_frames = 0usize;
-        let mut first_loop_frame: Option<usize> = None;
-        let mut fade_target_frame: Option<usize> = None;
-        let mut fade_requested = false;
-        let mut manual_fade_start: Option<usize> = None;
-        let mut finished = false;
-        let mut watchdog_hit = false;
 
-        while !finished && rendered_frames < max_frames {
-            if !fade_requested {
-                if let Some(target) = fade_target_frame {
-                    if rendered_frames >= target {
-                        controller.request_transition(FADE_SECONDS);
-                        fade_requested = true;
-                        manual_fade_start = Some(rendered_frames);
-                    }
-                }
-            }
-
-            let mut frames_this_block = BLOCK_FRAMES.min(max_frames - rendered_frames);
-
-            // Stop exactly at the scheduled fade start rather than allowing
-            // the block size to shift the fade timing.
-            if !fade_requested {
-                if let Some(target) = fade_target_frame {
-                    let remaining = target.saturating_sub(rendered_frames);
-                    if remaining > 0 {
-                        frames_this_block = frames_this_block.min(remaining);
-                    }
-                }
-            }
-
+        while rendered_frames < target_frames {
+            let frames_this_block = BLOCK_FRAMES.min(target_frames - rendered_frames);
             let chunk = &mut buf[..2 * frames_this_block];
             controller.fill(chunk, &config);
             stereo.extend_from_slice(chunk);
             rendered_frames += frames_this_block;
-
-            for event in controller.take_messages() {
-                match event {
-                    PlaybackEvent::Looped => {
-                        if first_loop_frame.is_none() {
-                            first_loop_frame = Some(rendered_frames);
-                            if let Some(period) = loop_frames {
-                                let fade_frames = FADE_FRAMES.min(period);
-                                // We are now at the start of pass two. Fade
-                                // during its final 8 seconds and finish at
-                                // the second loop boundary.
-                                fade_target_frame = Some(
-                                    rendered_frames + period.saturating_sub(fade_frames),
-                                );
-                            }
-                        }
-                    }
-                    PlaybackEvent::Finished => finished = true,
-                    PlaybackEvent::TransitionStarted => {}
-                }
-            }
-
-            // A manually requested fade has a known exact start. Trim any
-            // zero-filled tail from the final render block after completion.
-            if finished {
-                if let Some(start) = manual_fade_start {
-                    let exact_end = start.saturating_add(FADE_FRAMES).saturating_add(1);
-                    let keep_frames = exact_end.min(rendered_frames);
-                    stereo.truncate(keep_frames * 2);
-                }
-            }
-        }
-
-        if !finished {
-            watchdog_hit = true;
-        }
-        if watchdog_hit {
-            eprintln!(
-                "song {id}: stopped after {:.1}s without Finished (estimated sequence length {:.1}s, loop detected: {}); skipping to prevent unbounded memory use",
-                rendered_frames as f64 / f64::from(SAMPLE_RATE),
-                estimated_seconds,
-                loop_frames.is_some()
-            );
-            continue;
         }
 
         let wav = encode_stereo_i16(&stereo, SAMPLE_RATE);
@@ -224,7 +147,7 @@ pub fn run(args: Args) -> ExitCode {
             println!(
                 "  rendered {rendered_count}/{} (song {id}, {}, {:.2}s)",
                 song_ids.len(),
-                if loop_frames.is_some() { "two passes" } else { "one-shot" },
+                passes_label,
                 stereo.len() as f64 / 2.0 / f64::from(SAMPLE_RATE)
             );
         }
