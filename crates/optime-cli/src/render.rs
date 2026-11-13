@@ -6,9 +6,9 @@ use std::process::ExitCode;
 use clap::Parser;
 use optime_core::{PerDeviceSettings, SynthController, load_all};
 
-use crate::wav::encode_mono_i16;
+use crate::wav::encode_stereo_i16;
 
-const SAMPLE_RATE: u32 = 32_768;
+const SAMPLE_RATE: u32 = 48_000;
 
 #[derive(Parser)]
 #[command(about = "Render every playable song in an archive to a mono WAV, plus a manifest.")]
@@ -56,17 +56,19 @@ pub fn run(args: Args) -> ExitCode {
             eprintln!("song {id}: failed to start, skipping");
             continue;
         };
-        let mut mono = Vec::with_capacity(frames);
-        let mut buf = vec![0.0f32; 2 * 512];
-        while mono.len() < frames {
-            let n = 512.min(frames - mono.len());
-            let chunk = &mut buf[..2 * n];
-            controller.fill(chunk, &config);
-            for frame in chunk.chunks_exact(2) {
-                mono.push(0.5 * (frame[0] + frame[1]));
-            }
-        }
-        let wav = encode_mono_i16(&mono, SAMPLE_RATE);
+let mut stereo = Vec::with_capacity(frames * 2);
+let mut buf = vec![0.0f32; 2 * 512];
+
+while stereo.len() / 2 < frames {
+    let n = 512.min(frames - stereo.len() / 2);
+    let chunk = &mut buf[..2 * n];
+
+    controller.fill(chunk, &config);
+
+    // Preserve interleaved stereo samples: L, R, L, R...
+    stereo.extend_from_slice(chunk);
+}
+let wav = encode_stereo_i16(&stereo, SAMPLE_RATE);
         let path = Path::new(&args.out_dir).join(&wav_name);
         if let Err(e) = std::fs::write(&path, wav) {
             eprintln!("Failed to write '{}': {e}", path.display());
