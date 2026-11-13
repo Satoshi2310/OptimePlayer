@@ -74,8 +74,6 @@ pub fn run(args: Args) -> ExitCode {
         let mut buf = vec![0.0f32; 2 * BLOCK_FRAMES];
         let mut rendered_frames = 0usize;
         let mut first_loop_frame: Option<usize> = None;
-        let mut loop_frames: Option<usize> = None;
-        let mut third_pass_start: Option<usize> = None;
         let mut fade_target_frame: Option<usize> = None;
         let mut fade_requested = false;
         let mut manual_fade_start: Option<usize> = None;
@@ -114,10 +112,8 @@ pub fn run(args: Args) -> ExitCode {
                 match event {
                     PlaybackEvent::Looped => {
                         if let Some(first) = first_loop_frame {
-                            if loop_frames.is_none() {
+                            if fade_target_frame.is_none() {
                                 let period = rendered_frames.saturating_sub(first);
-                                loop_frames = Some(period);
-                                third_pass_start = Some(rendered_frames);
                                 let fade_frames = FADE_FRAMES.min(period);
                                 fade_target_frame = Some(
                                     rendered_frames + period.saturating_sub(fade_frames),
