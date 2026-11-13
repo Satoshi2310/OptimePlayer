@@ -1,0 +1,38 @@
+
+name: Build Optime CLI (Windows)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build optime-cli
+        shell: pwsh
+        env:
+          # Target x86-64-v3: AVX2/FMA, suitable for modern Intel CPUs.
+          # Avoid compiling specifically for the GitHub runner CPU.
+          RUSTFLAGS: "-C target-cpu=x86-64-v3"
+        run: |
+          cargo build --release -p optime-cli --bin optime-cli
+
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: optime-cli-windows-x64
+          path: target/release/optime-cli.exe
+          if-no-files-found: error
