@@ -14,6 +14,7 @@ const SAMPLE_RATE: u32 = 48_000;
 const BLOCK_FRAMES: usize = 512;
 const FADE_SECONDS: f64 = 8.0;
 const FADE_FRAMES: usize = (SAMPLE_RATE as f64 * FADE_SECONDS) as usize;
+const MAX_SONG_RENDER_SECONDS: f64 = 600.0;
 
 #[derive(Parser)]
 #[command(about = "Render every playable song to 48 kHz stereo PCM WAV: two complete passes, then an 8-second fade on the third.")]
@@ -70,6 +71,17 @@ pub fn run(args: Args) -> ExitCode {
             fade_seconds: FADE_SECONDS,
         });
 
+        // song_length_seconds simulates the sequence until its second loop
+        // marker (or natural end). Use it as a watchdog so malformed or
+        // non-terminating sequences cannot grow the PCM Vec without bound.
+        let estimated_seconds = data
+            .song_length_seconds(id)
+            .unwrap_or(180.0)
+            .clamp(1.0, MAX_SONG_RENDER_SECONDS);
+        let max_frames = ((estimated_seconds * 3.0 + FADE_SECONDS)
+            .min(MAX_SONG_RENDER_SECONDS)
+            * f64::from(SAMPLE_RATE)) as usize;
+
         let mut stereo = Vec::<f32>::new();
         let mut buf = vec![0.0f32; 2 * BLOCK_FRAMES];
         let mut rendered_frames = 0usize;
@@ -78,8 +90,9 @@ pub fn run(args: Args) -> ExitCode {
         let mut fade_requested = false;
         let mut manual_fade_start: Option<usize> = None;
         let mut finished = false;
+        let mut watchdog_hit = false;
 
-        while !finished {
+        while !finished && rendered_frames < max_frames {
             if !fade_requested {
                 if let Some(target) = fade_target_frame {
                     if rendered_frames >= target {
@@ -90,7 +103,7 @@ pub fn run(args: Args) -> ExitCode {
                 }
             }
 
-            let mut frames_this_block = BLOCK_FRAMES;
+            let mut frames_this_block = BLOCK_FRAMES.min(max_frames - rendered_frames);
 
             // Stop exactly at the scheduled fade start rather than allowing
             // the block size to shift the fade timing.
@@ -137,6 +150,18 @@ pub fn run(args: Args) -> ExitCode {
                     stereo.truncate(keep_frames * 2);
                 }
             }
+        }
+
+        if !finished {
+            watchdog_hit = true;
+        }
+        if watchdog_hit {
+            eprintln!(
+                "song {id}: stopped after {:.1}s without Finished (estimated sequence length {:.1}s); skipping to prevent unbounded memory use",
+                rendered_frames as f64 / f64::from(SAMPLE_RATE),
+                estimated_seconds
+            );
+            continue;
         }
 
         let wav = encode_stereo_i16(&stereo, SAMPLE_RATE);
