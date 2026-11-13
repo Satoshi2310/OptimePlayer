@@ -6,8 +6,9 @@ use std::process::ExitCode;
 use clap::Parser;
 use optime_core::{
     LoopAndTransitionOptions, PerDeviceSettings, SynthController, SynthEvent,
-    TickFeedback, load_all,
+    load_all,
 };
+use optime_core::synth_controller::messages::TickFeedback;
 
 use crate::wav::encode_stereo_i16;
 
