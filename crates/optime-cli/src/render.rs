@@ -4,19 +4,22 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use optime_core::{PerDeviceSettings, SynthController, load_all};
+use optime_core::{
+    LoopAndTransitionOptions, PerDeviceSettings, PlaybackEvent, SynthController, load_all,
+};
 
 use crate::wav::encode_stereo_i16;
 
 const SAMPLE_RATE: u32 = 48_000;
+const BLOCK_FRAMES: usize = 512;
+const FADE_SECONDS: f64 = 8.0;
+const FADE_FRAMES: usize = (SAMPLE_RATE as f64 * FADE_SECONDS) as usize;
 
 #[derive(Parser)]
-#[command(about = "Render every playable song in an archive to a mono WAV, plus a manifest.")]
+#[command(about = "Render every playable song to 48 kHz stereo PCM WAV: two complete passes, then an 8-second fade on the third.")]
 pub struct Args {
     archive: PathBuf,
     out_dir: PathBuf,
-    #[arg(default_value_t = 40.0)]
-    seconds: f64,
 }
 
 pub fn run(args: Args) -> ExitCode {
@@ -41,14 +44,13 @@ pub fn run(args: Args) -> ExitCode {
 
     let song_ids = data.song_ids();
     println!(
-        "Loaded {} songs; rendering {:.0}s each.",
-        song_ids.len(),
-        args.seconds
+        "Loaded {} songs; rendering each as two complete passes plus a third-pass 8s fade (48 kHz stereo).",
+        song_ids.len()
     );
 
     let config = PerDeviceSettings::neutral();
-    let frames = (args.seconds * f64::from(SAMPLE_RATE)) as usize;
     let mut manifest = String::from("[\n");
+    let mut rendered_count = 0usize;
 
     for (index, &id) in song_ids.iter().enumerate() {
         let wav_name = format!("{index:04}_{id}.wav");
@@ -56,44 +58,125 @@ pub fn run(args: Args) -> ExitCode {
             eprintln!("song {id}: failed to start, skipping");
             continue;
         };
-let mut stereo = Vec::with_capacity(frames * 2);
-let mut buf = vec![0.0f32; 2 * 512];
 
-while stereo.len() / 2 < frames {
-    let n = 512.min(frames - stereo.len() / 2);
-    let chunk = &mut buf[..2 * n];
+        // Do not let the controller start fading at the second loop boundary.
+        // We measure one complete loop, then request the fade 8 seconds before
+        // the end of the following (third) pass.
+        controller.set_loop_and_transition(LoopAndTransitionOptions {
+            loops_before_fade: None,
+            too_long_after_loop_threshold_seconds: None,
+            fade_on_end: true,
+            grace_seconds: 0.0,
+            fade_seconds: FADE_SECONDS,
+        });
 
-    controller.fill(chunk, &config);
+        let mut stereo = Vec::<f32>::new();
+        let mut buf = vec![0.0f32; 2 * BLOCK_FRAMES];
+        let mut rendered_frames = 0usize;
+        let mut first_loop_frame: Option<usize> = None;
+        let mut loop_frames: Option<usize> = None;
+        let mut third_pass_start: Option<usize> = None;
+        let mut fade_target_frame: Option<usize> = None;
+        let mut fade_requested = false;
+        let mut manual_fade_start: Option<usize> = None;
+        let mut finished = false;
 
-    // Preserve interleaved stereo samples: L, R, L, R...
-    stereo.extend_from_slice(chunk);
-}
-let wav = encode_stereo_i16(&stereo, SAMPLE_RATE);
+        while !finished {
+            if !fade_requested {
+                if let Some(target) = fade_target_frame {
+                    if rendered_frames >= target {
+                        controller.request_transition(FADE_SECONDS);
+                        fade_requested = true;
+                        manual_fade_start = Some(rendered_frames);
+                    }
+                }
+            }
+
+            let mut frames_this_block = BLOCK_FRAMES;
+
+            // Stop exactly at the scheduled fade start rather than allowing
+            // the block size to shift the fade timing.
+            if !fade_requested {
+                if let Some(target) = fade_target_frame {
+                    let remaining = target.saturating_sub(rendered_frames);
+                    if remaining > 0 {
+                        frames_this_block = frames_this_block.min(remaining);
+                    }
+                }
+            }
+
+            let chunk = &mut buf[..2 * frames_this_block];
+            controller.fill(chunk, &config);
+            stereo.extend_from_slice(chunk);
+            rendered_frames += frames_this_block;
+
+            for event in controller.take_messages() {
+                match event {
+                    PlaybackEvent::Looped => {
+                        if let Some(first) = first_loop_frame {
+                            if loop_frames.is_none() {
+                                let period = rendered_frames.saturating_sub(first);
+                                loop_frames = Some(period);
+                                third_pass_start = Some(rendered_frames);
+                                let fade_frames = FADE_FRAMES.min(period);
+                                fade_target_frame = Some(
+                                    rendered_frames + period.saturating_sub(fade_frames),
+                                );
+                            }
+                        } else {
+                            first_loop_frame = Some(rendered_frames);
+                        }
+                    }
+                    PlaybackEvent::Finished => finished = true,
+                    PlaybackEvent::TransitionStarted => {}
+                }
+            }
+
+            // A manually requested fade has a known exact start. Trim any
+            // zero-filled tail from the final render block after completion.
+            if finished {
+                if let Some(start) = manual_fade_start {
+                    let exact_end = start.saturating_add(FADE_FRAMES).saturating_add(1);
+                    let keep_frames = exact_end.min(rendered_frames);
+                    stereo.truncate(keep_frames * 2);
+                }
+            }
+        }
+
+        let wav = encode_stereo_i16(&stereo, SAMPLE_RATE);
         let path = Path::new(&args.out_dir).join(&wav_name);
         if let Err(e) = std::fs::write(&path, wav) {
             eprintln!("Failed to write '{}': {e}", path.display());
             return ExitCode::FAILURE;
         }
-        if index > 0 {
+
+        if rendered_count > 0 {
             manifest.push_str(",\n");
         }
         manifest.push_str(&format!(
-            "  {{ \"index\": {index}, \"songId\": {id}, \"wav\": \"{wav_name}\" }}"
+            "  {{ \"index\": {index}, \"songId\": {id}, \"wav\": \"{wav_name}\", \"frames\": {}}}",
+            stereo.len() / 2
         ));
-        if index % 50 == 0 {
-            println!("  rendered {index}/{} (song {id})", song_ids.len());
+        rendered_count += 1;
+
+        if rendered_count == 1 || rendered_count % 10 == 0 {
+            println!(
+                "  rendered {rendered_count}/{} (song {id}, {:.2}s)",
+                song_ids.len(),
+                stereo.len() as f64 / 2.0 / f64::from(SAMPLE_RATE)
+            );
         }
     }
-    manifest.push_str("\n]\n");
 
+    manifest.push_str("\n]\n");
     let manifest_path = Path::new(&args.out_dir).join("manifest.json");
     if let Err(e) = std::fs::write(&manifest_path, manifest) {
         eprintln!("Failed to write '{}': {e}", manifest_path.display());
         return ExitCode::FAILURE;
     }
+
     println!(
-        "Wrote {} WAVs + {} to {}",
-        song_ids.len(),
+        "Wrote {rendered_count} WAVs + {} to {}",
         manifest_path.display(),
         args.out_dir.display()
     );
