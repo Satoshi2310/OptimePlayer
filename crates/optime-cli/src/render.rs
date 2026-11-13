@@ -15,13 +15,12 @@ use crate::wav::encode_stereo_i16;
 const SAMPLE_RATE: u32 = 48_000;
 const BLOCK_FRAMES: usize = 512;
 const MAX_SONG_RENDER_SECONDS: f64 = 600.0;
+const FADE_SECONDS: f64 = 8.0;
+const FADE_FRAMES: usize = (SAMPLE_RATE as f64 * FADE_SECONDS) as usize;
 
-/// Sequence preflight: determine whether a song ends naturally or loops.
+/// Measure one complete sequence pass without rendering audio.
 #[derive(Clone, Copy, Debug)]
-enum SequencePlan {
-    OneShot { seconds: f64 },
-    Looping { loop_seconds: f64 },
-}
+enum SequencePlan { Pass { seconds: f64 } }
 
 fn sequence_plan(data: &dyn optime_core::SoundData, id: u32) -> Option<SequencePlan> {
     let mut player = data.make_player(id)?;
@@ -34,19 +33,15 @@ fn sequence_plan(data: &dyn optime_core::SoundData, id: u32) -> Option<SequenceP
     for ticks in 1..=max_ticks {
         events.clear();
         player.tick(&mut feedback, &config, &mut events);
-        for event in &events {
-            match event {
-                SynthEvent::Looped => return Some(SequencePlan::Looping { loop_seconds: ticks as f64 / tick_rate }),
-                SynthEvent::Ended => return Some(SequencePlan::OneShot { seconds: ticks as f64 / tick_rate }),
-                _ => {}
-            }
+        if events.iter().any(|event| matches!(event, SynthEvent::Looped | SynthEvent::Ended)) {
+            return Some(SequencePlan::Pass { seconds: ticks as f64 / tick_rate });
         }
     }
     None
 }
 
 #[derive(Parser)]
-#[command(about = "Render every playable song to 48 kHz stereo PCM WAV: one pass for one-shots, two passes for looped songs, no fade.")]
+#[command(about = "Render every playable song to 48 kHz stereo PCM WAV: two complete repeats plus a third repeat with an 8-second fade.")]
 pub struct Args {
     archive: PathBuf,
     out_dir: PathBuf,
@@ -74,7 +69,7 @@ pub fn run(args: Args) -> ExitCode {
 
     let song_ids = data.song_ids();
     println!(
-        "Loaded {} songs; one-shot tracks play once, looping tracks play twice, without fades (48 kHz stereo).",
+        "Loaded {} songs; each song gets two complete repeats plus a third repeat with an 8-second fade (48 kHz stereo).",
         song_ids.len()
     );
 
@@ -89,54 +84,55 @@ pub fn run(args: Args) -> ExitCode {
             continue;
         };
 
-        // One-shot sequences render once; looped sequences render two passes.
-        // No transition or fade is applied.
+        // Render one complete pass, then repeat the PCM twice. This also
+        // handles sequences without an internal loop marker.
         controller.set_loop_and_transition(LoopAndTransitionOptions::none());
 
-        let plan = sequence_plan(&*data, id);
-        let (passes_label, target_frames) = match plan {
-            Some(SequencePlan::OneShot { seconds }) => (
-                "one-shot",
-                (seconds * f64::from(SAMPLE_RATE)) as usize,
-            ),
-            Some(SequencePlan::Looping { loop_seconds }) => (
-                "two passes",
-                (loop_seconds * 2.0 * f64::from(SAMPLE_RATE)) as usize,
-            ),
+        let seconds = match sequence_plan(&*data, id) {
+            Some(SequencePlan::Pass { seconds }) => seconds,
             None => {
-                // Never drop a track just because preflight cannot classify it.
-                // Fall back to the archive duration estimate, then to 40 seconds.
-                let seconds = data
-                    .song_length_seconds(id)
+                let fallback = data.song_length_seconds(id)
                     .filter(|s| s.is_finite() && *s >= 1.0 && *s < MAX_SONG_RENDER_SECONDS)
+                    .map(|s| (s / 2.0).max(1.0))
                     .unwrap_or(40.0);
-                eprintln!(
-                    "song {id}: sequence classification unavailable; rendering fallback duration {seconds:.2}s"
-                );
-                ("fallback", (seconds * f64::from(SAMPLE_RATE)) as usize)
+                eprintln!("song {id}: no sequence end marker during preflight; using bounded {fallback:.2}s pass");
+                fallback
             }
         };
 
-        let target_frames = if target_frames == 0
-            || target_frames > (MAX_SONG_RENDER_SECONDS * f64::from(SAMPLE_RATE)) as usize
-        {
-            eprintln!("song {id}: invalid duration estimate; using 40-second fallback");
-            (40.0 * f64::from(SAMPLE_RATE)) as usize
-        } else {
-            target_frames
-        };
+        let estimated_frames = (seconds * f64::from(SAMPLE_RATE)) as usize;
+        let pass_frames = if estimated_frames == 0 || estimated_frames > (MAX_SONG_RENDER_SECONDS * f64::from(SAMPLE_RATE)) as usize {
+            eprintln!("song {id}: invalid pass length; using 40-second fallback");
+            40 * SAMPLE_RATE as usize
+        } else { estimated_frames };
 
-        let mut stereo = Vec::<f32>::with_capacity(target_frames.saturating_mul(2));
+        let mut pass = Vec::<f32>::with_capacity(pass_frames.saturating_mul(2));
         let mut buf = vec![0.0f32; 2 * BLOCK_FRAMES];
         let mut rendered_frames = 0usize;
-
-        while rendered_frames < target_frames {
-            let frames_this_block = BLOCK_FRAMES.min(target_frames - rendered_frames);
+        while rendered_frames < pass_frames {
+            let frames_this_block = BLOCK_FRAMES.min(pass_frames - rendered_frames);
             let chunk = &mut buf[..2 * frames_this_block];
             controller.fill(chunk, &config);
-            stereo.extend_from_slice(chunk);
+            pass.extend_from_slice(chunk);
             rendered_frames += frames_this_block;
         }
+
+        let pass_samples = pass.len();
+        let mut stereo = Vec::<f32>::with_capacity(pass_samples.saturating_mul(3));
+        stereo.extend_from_slice(&pass);
+        stereo.extend_from_slice(&pass);
+        stereo.extend_from_slice(&pass);
+
+        // Fade only the last eight seconds of the third repeat.
+        let fade_frames = FADE_FRAMES.min(pass_frames);
+        let fade_start = pass_frames * 3 - fade_frames;
+        for frame in 0..fade_frames {
+            let gain = 1.0 - frame as f32 / fade_frames as f32;
+            let offset = (fade_start + frame) * 2;
+            stereo[offset] *= gain;
+            stereo[offset + 1] *= gain;
+        }
+        let passes_label = "three repeats (third fades)";
 
         let wav = encode_stereo_i16(&stereo, SAMPLE_RATE);
         let path = Path::new(&args.out_dir).join(&wav_name);
