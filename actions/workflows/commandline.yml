@@ -1,0 +1,39 @@
+
+name: Build Native CLI (Windows x64)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Compile optime-cli.exe
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Compile CLI
+        run: cargo build --release -p optime-cli --bin optime-cli
+
+      - name: Package executable
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item target/release/optime-cli.exe dist/
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: optime-cli-windows-x64
+          path: dist/optime-cli.exe
+          if-no-files-found: error
