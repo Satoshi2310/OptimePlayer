@@ -5,7 +5,8 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use optime_core::{
-    LoopAndTransitionOptions, PerDeviceSettings, PlaybackEvent, SynthController, load_all,
+    LoopAndTransitionOptions, PerDeviceSettings, PlaybackEvent, SynthController, SynthEvent,
+    TickFeedback, load_all,
 };
 
 use crate::wav::encode_stereo_i16;
@@ -15,6 +16,36 @@ const BLOCK_FRAMES: usize = 512;
 const FADE_SECONDS: f64 = 8.0;
 const FADE_FRAMES: usize = (SAMPLE_RATE as f64 * FADE_SECONDS) as usize;
 const MAX_SONG_RENDER_SECONDS: f64 = 600.0;
+
+/// Returns the duration up to the first sequence loop marker, or None when
+/// the sequence ends naturally before looping. This is a lightweight
+/// sequence-only preflight; it does not render audio.
+fn first_loop_seconds(data: &dyn optime_core::SoundData, id: u32) -> Option<f64> {
+    let mut player = data.make_player(id)?;
+    let tick_rate = player.tick_rate();
+    if !tick_rate.is_finite() || tick_rate <= 0.0 {
+        return None;
+    }
+
+    let config = PerDeviceSettings::neutral();
+    let mut feedback = TickFeedback::default();
+    let mut events = Vec::new();
+    let max_ticks = (tick_rate * MAX_SONG_RENDER_SECONDS) as u64;
+
+    for ticks in 1..=max_ticks {
+        events.clear();
+        player.tick(&mut feedback, &config, &mut events);
+        for event in &events {
+            match event {
+                SynthEvent::Looped => return Some(ticks as f64 / tick_rate),
+                SynthEvent::Ended => return None,
+                _ => {}
+            }
+        }
+    }
+
+    None
+}
 
 #[derive(Parser)]
 #[command(about = "Render every playable song to 48 kHz stereo PCM WAV: two complete passes, then an 8-second fade on the third.")]
@@ -45,7 +76,7 @@ pub fn run(args: Args) -> ExitCode {
 
     let song_ids = data.song_ids();
     println!(
-        "Loaded {} songs; rendering each as two complete passes plus a third-pass 8s fade (48 kHz stereo).",
+        "Loaded {} songs; one-shot tracks play once, looping tracks play twice, with an 8s ending fade (48 kHz stereo).",
         song_ids.len()
     );
 
@@ -60,9 +91,11 @@ pub fn run(args: Args) -> ExitCode {
             continue;
         };
 
-        // Do not let the controller start fading at the second loop boundary.
-        // We measure one complete loop, then request the fade 8 seconds before
-        // the end of the following (third) pass.
+        // Preflight the sequence to distinguish a one-shot song from a
+        // looped song. One-shots are allowed to reach their natural Ended
+        // event. Looped songs get exactly one repeat, then fade during the
+        // second pass so they finish without a hard cut.
+        let loop_seconds = first_loop_seconds(&*data, id);
         controller.set_loop_and_transition(LoopAndTransitionOptions {
             loops_before_fade: None,
             too_long_after_loop_threshold_seconds: None,
@@ -71,16 +104,21 @@ pub fn run(args: Args) -> ExitCode {
             fade_seconds: FADE_SECONDS,
         });
 
-        // song_length_seconds simulates the sequence until its second loop
-        // marker (or natural end). Use it as a watchdog so malformed or
-        // non-terminating sequences cannot grow the PCM Vec without bound.
         let estimated_seconds = data
             .song_length_seconds(id)
             .unwrap_or(180.0)
             .clamp(1.0, MAX_SONG_RENDER_SECONDS);
-        let max_frames = ((estimated_seconds * 3.0 + FADE_SECONDS)
-            .min(MAX_SONG_RENDER_SECONDS)
-            * f64::from(SAMPLE_RATE)) as usize;
+        let loop_frames = loop_seconds
+            .map(|seconds| (seconds * f64::from(SAMPLE_RATE)) as usize);
+        let max_frames = match loop_frames {
+            Some(period) => period
+                .saturating_mul(2)
+                .saturating_add(BLOCK_FRAMES * 4)
+                .min((MAX_SONG_RENDER_SECONDS * f64::from(SAMPLE_RATE)) as usize),
+            None => ((estimated_seconds + FADE_SECONDS + 10.0)
+                .min(MAX_SONG_RENDER_SECONDS)
+                * f64::from(SAMPLE_RATE)) as usize,
+        };
 
         let mut stereo = Vec::<f32>::new();
         let mut buf = vec![0.0f32; 2 * BLOCK_FRAMES];
@@ -124,16 +162,17 @@ pub fn run(args: Args) -> ExitCode {
             for event in controller.take_messages() {
                 match event {
                     PlaybackEvent::Looped => {
-                        if let Some(first) = first_loop_frame {
-                            if fade_target_frame.is_none() {
-                                let period = rendered_frames.saturating_sub(first);
+                        if first_loop_frame.is_none() {
+                            first_loop_frame = Some(rendered_frames);
+                            if let Some(period) = loop_frames {
                                 let fade_frames = FADE_FRAMES.min(period);
+                                // We are now at the start of pass two. Fade
+                                // during its final 8 seconds and finish at
+                                // the second loop boundary.
                                 fade_target_frame = Some(
                                     rendered_frames + period.saturating_sub(fade_frames),
                                 );
                             }
-                        } else {
-                            first_loop_frame = Some(rendered_frames);
                         }
                     }
                     PlaybackEvent::Finished => finished = true,
@@ -157,9 +196,10 @@ pub fn run(args: Args) -> ExitCode {
         }
         if watchdog_hit {
             eprintln!(
-                "song {id}: stopped after {:.1}s without Finished (estimated sequence length {:.1}s); skipping to prevent unbounded memory use",
+                "song {id}: stopped after {:.1}s without Finished (estimated sequence length {:.1}s, loop detected: {}); skipping to prevent unbounded memory use",
                 rendered_frames as f64 / f64::from(SAMPLE_RATE),
-                estimated_seconds
+                estimated_seconds,
+                loop_frames.is_some()
             );
             continue;
         }
@@ -182,8 +222,9 @@ pub fn run(args: Args) -> ExitCode {
 
         if rendered_count == 1 || rendered_count % 10 == 0 {
             println!(
-                "  rendered {rendered_count}/{} (song {id}, {:.2}s)",
+                "  rendered {rendered_count}/{} (song {id}, {}, {:.2}s)",
                 song_ids.len(),
+                if loop_frames.is_some() { "two passes" } else { "one-shot" },
                 stereo.len() as f64 / 2.0 / f64::from(SAMPLE_RATE)
             );
         }
