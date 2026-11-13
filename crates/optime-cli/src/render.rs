@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use optime_core::{
-    LoopAndTransitionOptions, PerDeviceSettings, PlaybackEvent, SynthController, SynthEvent,
+    LoopAndTransitionOptions, PerDeviceSettings, SynthController, SynthEvent,
     TickFeedback, load_all,
 };
 
@@ -13,8 +13,6 @@ use crate::wav::encode_stereo_i16;
 
 const SAMPLE_RATE: u32 = 48_000;
 const BLOCK_FRAMES: usize = 512;
-const FADE_SECONDS: f64 = 8.0;
-const FADE_FRAMES: usize = (SAMPLE_RATE as f64 * FADE_SECONDS) as usize;
 const MAX_SONG_RENDER_SECONDS: f64 = 600.0;
 
 /// Sequence preflight: determine whether a song ends naturally or loops.
