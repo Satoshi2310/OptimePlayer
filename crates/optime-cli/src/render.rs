@@ -108,7 +108,8 @@ pub fn run(args: Args) -> ExitCode {
             stereo.extend_from_slice(chunk);
             rendered_frames += frames_this_block;
 
-            for event in controller.take_messages() {
+            let events: Vec<_> = controller.take_messages().collect();
+            for event in events {
                 match event {
                     PlaybackEvent::Looped => {
                         if let Some(first) = first_loop_frame {
