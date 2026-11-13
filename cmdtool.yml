@@ -1,0 +1,39 @@
+
+name: Build OptimePlayer CLI
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'crates/optime-cli/**'
+      - 'crates/optime-core/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+      - '.github/workflows/build-windows-cli.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust Nightly
+        run: rustup show
+
+      - name: Build CLI
+        run: cargo build --release -p optime-cli --bin optime-cli
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: optime-cli-windows-x64
+          path: target/release/optime-cli.exe
+          if-no-files-found: error
+          retention-days: 30
