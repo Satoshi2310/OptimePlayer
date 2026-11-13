@@ -104,15 +104,27 @@ pub fn run(args: Args) -> ExitCode {
                 (loop_seconds * 2.0 * f64::from(SAMPLE_RATE)) as usize,
             ),
             None => {
-                eprintln!("song {id}: could not determine sequence end/loop; skipping safely");
-                continue;
+                // Never drop a track just because preflight cannot classify it.
+                // Fall back to the archive duration estimate, then to 40 seconds.
+                let seconds = data
+                    .song_length_seconds(id)
+                    .filter(|s| s.is_finite() && *s >= 1.0 && *s < MAX_SONG_RENDER_SECONDS)
+                    .unwrap_or(40.0);
+                eprintln!(
+                    "song {id}: sequence classification unavailable; rendering fallback duration {seconds:.2}s"
+                );
+                ("fallback", (seconds * f64::from(SAMPLE_RATE)) as usize)
             }
         };
 
-        if target_frames == 0 || target_frames > (MAX_SONG_RENDER_SECONDS * f64::from(SAMPLE_RATE)) as usize {
-            eprintln!("song {id}: invalid or excessive estimated duration; skipping");
-            continue;
-        }
+        let target_frames = if target_frames == 0
+            || target_frames > (MAX_SONG_RENDER_SECONDS * f64::from(SAMPLE_RATE)) as usize
+        {
+            eprintln!("song {id}: invalid duration estimate; using 40-second fallback");
+            (40.0 * f64::from(SAMPLE_RATE)) as usize
+        } else {
+            target_frames
+        };
 
         let mut stereo = Vec::<f32>::with_capacity(target_frames.saturating_mul(2));
         let mut buf = vec![0.0f32; 2 * BLOCK_FRAMES];
